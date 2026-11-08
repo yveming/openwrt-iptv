@@ -4,9 +4,11 @@
 # server, which identifies STBs by the vendor class (and serves the lease
 # in the operator's IPTV VLAN).  The OEM rule matches three prefixes:
 # "SCI", "sci" and the binary TLV header 00:00:1f (option 60 sub-type).
-# Shipped with iptv-scripts; not a user-tunable.
+# Shipped with kmod-iptv; not a user-tunable.
 
 CONF=/etc/dnsmasq.conf
+# Keep the historical marker string: changing it would append the rules a
+# second time on systems that already ran the old iptv-scripts package.
 MARK="# iptv-stb-ignore (iptv-scripts)"
 
 grep -q "$MARK" "$CONF" 2>/dev/null && exit 0

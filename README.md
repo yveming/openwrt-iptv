@@ -12,16 +12,15 @@ OpenWrt feed.
 
 | Path | Package | Description |
 | --- | --- | --- |
-| `kernel/iptv/` | `kmod-iptv` | Kernel module (`iptv.ko`) |
-| `net/iptv-scripts/` | `iptv-scripts` | UCI, init script and apply helper |
+| `kernel/iptv/` | `kmod-iptv` | Kernel module, UCI config, init script and apply logic |
 | `luci/luci-app-iptv/` | `luci-app-iptv` | Optional LuCI configuration page |
 | `airoha/` | — | Archived Airoha PON implementation (reference only) |
 | `docs/` | — | Design and offload notes |
 
 ## Status
 
-- `kernel/iptv`, `net/iptv-scripts` and `luci/luci-app-iptv`: maintained
-  generic implementation.
+- `kernel/iptv` and `luci/luci-app-iptv`: maintained generic
+  implementation.
 - `airoha/`: archived temporary HG5582A implementation. It modifies
   `airoha_eth` / `airoha_ppe` / `airoha-xpon` in ways that break the PON
   driver layering. Do not apply it to the main tree and do not package it.
@@ -40,8 +39,8 @@ ip link set itv up
 
 ## Configuration
 
-VLAN IDs and the uplink device live in `/etc/config/iptv`, installed by
-`iptv-scripts`:
+VLAN IDs and the uplink device live in `/etc/config/iptv`, shipped by
+`kmod-iptv`:
 
 ```uci
 config iptv 'config'
@@ -53,8 +52,8 @@ config iptv 'config'
 	option macaddr ''
 ```
 
-`iptv-scripts` creates `itv` at boot (`START=19`, before network). Select it
-in the image config (`CONFIG_PACKAGE_iptv-scripts=y`); `luci-app-iptv` also
+`kmod-iptv` creates `itv` at boot (`START=19`, before network). Select it
+in the image config (`CONFIG_PACKAGE_kmod-iptv=y`); `luci-app-iptv` also
 pulls it in through its package dependency. Address and bridging are
 configured with the standard Network pages:
 
@@ -70,7 +69,7 @@ As an OpenWrt feed (optional):
 ```sh
 echo 'src-git iptv https://github.com/yveming/openwrt-iptv.git' >> feeds.conf
 ./scripts/feeds update iptv
-./scripts/feeds install kmod-iptv iptv-scripts luci-app-iptv
+./scripts/feeds install kmod-iptv luci-app-iptv
 ```
 
 Standalone kernel module:
@@ -81,16 +80,17 @@ make -C /lib/modules/$(uname -r)/build M=$PWD/kernel/iptv/src modules
 
 ## Caveats
 
-- `iptv-scripts` creates `itv` before netifd starts. If `pon0` does not exist
+- `kmod-iptv` creates `itv` before netifd starts. If `pon0` does not exist
   yet, add a retry or a hotplug rule that waits for `pon0`.
 - `enabled=0` removes `itv`; any Network interface or bridge referring to it
-  will fail until `iptv-scripts` is enabled again.
+  will fail until `kmod-iptv` is enabled again.
 - The package name `luci-app-iptv` conflicts with the older bridge-based
   package in `pon_userspace`. Retire or rename one before installing both.
 - `airoha/` is an archive, not a feed package, and is not built.
 
 ## License
 
-- `kernel/iptv`: GPL-2.0-only (see `LICENSE`)
-- `net/iptv-scripts` and `luci/luci-app-iptv`: Apache-2.0 (see their `LICENSE` files)
+- `kernel/iptv/src`: GPL-2.0-only (see `LICENSE`)
+- `kernel/iptv/files` and `luci/luci-app-iptv`: Apache-2.0 (see
+  `kernel/iptv/LICENSE.scripts` and `luci/luci-app-iptv/LICENSE`)
 - `airoha/`: follows the licenses of the files it patches.

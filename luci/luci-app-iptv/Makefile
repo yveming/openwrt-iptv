@@ -3,7 +3,7 @@
 include $(TOPDIR)/rules.mk
 
 LUCI_TITLE:=LuCI IPTV device configuration
-LUCI_DEPENDS:=+luci-base +iptv-scripts
+LUCI_DEPENDS:=+luci-base +kmod-iptv
 LUCI_PKGARCH:=all
 
 PKG_VERSION:=0.1.0

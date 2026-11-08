@@ -26,7 +26,7 @@ echo 43 3990 > /sys/class/net/itv/vids
 `0 0` disarms the demux and unregisters the receive handler. An unconfigured
 device stays inert: RX passes frames through and TX drops them.
 
-`iptv-scripts` owns `/etc/config/iptv`, creates the device at boot and writes
+`kmod-iptv` owns `/etc/config/iptv`, creates the device at boot and writes
 the sysfs file. Addressing and bridging are left to the standard Network
 pages; no custom netifd protocol is required.
 

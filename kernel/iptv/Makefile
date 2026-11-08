@@ -4,8 +4,9 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=iptv
-PKG_RELEASE:=1
-PKG_LICENSE:=GPL-2.0
+PKG_RELEASE:=2
+PKG_LICENSE:=GPL-2.0-only AND Apache-2.0
+PKG_MAINTAINER:=ming
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -19,7 +20,25 @@ endef
 
 define KernelPackage/iptv/description
   A single untagged Ethernet device carrying one unicast VLAN and one
-  multicast VLAN over the uplink.
+  multicast VLAN over the uplink. The package also installs the UCI
+  configuration, boot script and apply logic that create the device;
+  neither part is useful without the other.
+endef
+
+define KernelPackage/iptv/conffiles
+/etc/config/iptv
+endef
+
+define KernelPackage/iptv/install
+	$(INSTALL_DIR) $(1)/etc/config
+	$(INSTALL_CONF) $(CURDIR)/files/etc/config/iptv $(1)/etc/config/iptv
+
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) $(CURDIR)/files/etc/init.d/iptv $(1)/etc/init.d/iptv
+
+	$(INSTALL_DIR) $(1)/etc/uci-defaults
+	$(INSTALL_BIN) $(CURDIR)/files/etc/uci-defaults/30-iptv-stb-ignore \
+		$(1)/etc/uci-defaults/30-iptv-stb-ignore
 endef
 
 define Build/Prepare

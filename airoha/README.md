@@ -14,8 +14,8 @@ is not built by this repository.
   package.
 
 Do not apply these patches to the main tree and do not package this directory.
-The maintained generic implementation lives in `kernel/iptv`, `net/iptv-scripts`
-and `luci/luci-app-iptv`.
+The maintained generic implementation lives in `kernel/iptv` and
+`luci/luci-app-iptv`.
 
 ## Contents
 
