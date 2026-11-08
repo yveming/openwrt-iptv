@@ -1,0 +1,59 @@
+From 7947cf98a922a10c4d929840f3cf450e8a354340 Mon Sep 17 00:00:00 2001
+From: ming <ming@localhost>
+Date: Mon, 2 Nov 2026 13:39:29 +0800
+Subject: [PATCH] airoha-xpon: allow MAC changes on the PON service netdev
+
+---
+ airoha-xpon/Makefile                  |  2 +-
+ airoha-xpon/src/airoha-xpon-service.c | 18 ++++++++++--------
+ 2 files changed, 11 insertions(+), 9 deletions(-)
+
+diff --git a/airoha-xpon/Makefile b/airoha-xpon/Makefile
+index b36bccd..f34b34e 100644
+--- a/airoha-xpon/Makefile
++++ b/airoha-xpon/Makefile
+@@ -6,7 +6,7 @@ include $(TOPDIR)/rules.mk
+ include $(INCLUDE_DIR)/kernel.mk
+ 
+ PKG_NAME:=airoha-xpon
+-PKG_RELEASE:=70
++PKG_RELEASE:=71
+ PKG_LICENSE:=GPL-2.0-only
+ 
+ include $(INCLUDE_DIR)/package.mk
+diff --git a/airoha-xpon/src/airoha-xpon-service.c b/airoha-xpon/src/airoha-xpon-service.c
+index 6ab430b..71b3ea4 100644
+--- a/airoha-xpon/src/airoha-xpon-service.c
++++ b/airoha-xpon/src/airoha-xpon-service.c
+@@ -105,18 +105,20 @@ static const struct net_device_ops airoha_xpon_service_netdev_ops = {
+ 	.ndo_open = airoha_xpon_service_open,
+ 	.ndo_stop = airoha_xpon_service_stop,
+ 	.ndo_start_xmit = airoha_xpon_service_xmit,
++	.ndo_set_mac_address = eth_mac_addr,
++	.ndo_validate_addr = eth_validate_addr,
+ };
+ 
+ static void airoha_xpon_service_setup(struct net_device *netdev)
+ {
+-	netdev->type = ARPHRD_ETHER;
+-	netdev->hard_header_len = ETH_HLEN;
+-	netdev->addr_len = ETH_ALEN;
+-	netdev->mtu = ETH_DATA_LEN;
+-	netdev->min_mtu = ETH_MIN_MTU;
+-	netdev->max_mtu = ETH_DATA_LEN;
+-	netdev->tx_queue_len = 1000;
+-	netdev->flags = IFF_BROADCAST | IFF_MULTICAST;
++	/*
++	 * Use the standard Ethernet setup: the IP stack needs header_ops to
++	 * build the Ethernet header when this device is used as a route
++	 * interface, and eth_mac_addr() above needs the standard addr_len and
++	 * broadcast fields.  The driver's own ndo_start_xmit and MAC
++	 * operations replace the generic ones afterwards.
++	 */
++	ether_setup(netdev);
+ 	netdev->netdev_ops = &airoha_xpon_service_netdev_ops;
+ 	netdev->needs_free_netdev = true;
+ }
+-- 
+2.30.2
+

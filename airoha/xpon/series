@@ -1,0 +1,5 @@
+airoha-xpon-expose-pon-service-vlan-translation.patch
+airoha-xpon-add-logical-pon-service-interface.patch
+airoha-xpon-expose-pcs-auto-mode-diagnostics.patch
+airoha-xpon-allow-mac-changes-on-pon-service-netdev.patch
+airoha-xpon-align-service-netdev-with-standard-vlan-upper.patch

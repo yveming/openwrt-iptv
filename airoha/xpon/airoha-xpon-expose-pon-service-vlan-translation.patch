@@ -1,0 +1,126 @@
+From a877ab66d2f1920c2a607a67c06e6a97290ccb0a Mon Sep 17 00:00:00 2001
+From: ming <ming@localhost>
+Date: Sun, 1 Nov 2026 04:16:30 +0800
+Subject: [PATCH] airoha-xpon: expose PON service VLAN translation
+
+Add a vlan_map sysfs attribute that folds an operator multicast VLAN into the single exposed service VLAN. The table is programmed through the exported airoha_eth PON helper and applied before the frame reaches the VLAN upper.
+---
+ airoha-xpon/src/airoha-xpon-control.c | 88 +++++++++++++++++++++++++++
+ 1 file changed, 88 insertions(+)
+
+diff --git a/airoha-xpon/src/airoha-xpon-control.c b/airoha-xpon/src/airoha-xpon-control.c
+index 9ef7e85..a985cdb 100644
+--- a/airoha-xpon/src/airoha-xpon-control.c
++++ b/airoha-xpon/src/airoha-xpon-control.c
+@@ -3,6 +3,7 @@
+ #include <linux/airoha-eth.h>
+ #include <linux/device.h>
+ #include <linux/hex.h>
++#include <linux/if_vlan.h>
+ #include <linux/netdevice.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+@@ -292,6 +293,92 @@ static ssize_t data_path_store(struct device *dev,
+ 	ret = airoha_xpon_configure_data_path(xpon, alloc_id, gem_id);
+ 	return ret ? ret : count;
+ }
++
++/*
++ * PON-side service VLAN translation.  This is deliberately a small sysfs
++ * surface instead of the vendor /dev/ponvlan ioctl: the HG5582A IPTV
++ * integration only needs the downstream multicast VLAN (for example 3990)
++ * folded into the single exposed service VLAN (pon0.43).  The Linux bridge
++ * and PPE then see one VLAN and can keep the data path off the CPU.
++ */
++static ssize_t vlan_map_show(struct device *dev, struct device_attribute *attr,
++			     char *buf)
++{
++	struct airoha_xpon *xpon = dev_get_drvdata(dev);
++	struct airoha_pon_vlan_map map[AIROHA_PON_VLAN_MAP_MAX];
++	ssize_t len = 0;
++	int count, i;
++
++	count = airoha_eth_pon_get_vlan_map(xpon->pon_netdev, map,
++					    ARRAY_SIZE(map));
++	if (count < 0)
++		return count;
++
++	for (i = 0; i < count; i++) {
++		if (map[i].to == AIROHA_PON_VID_ANY)
++			len += sysfs_emit_at(buf, len, "%s%u:pop",
++					     i ? " " : "", map[i].from);
++		else
++			len += sysfs_emit_at(buf, len, "%s%u:%u",
++					     i ? " " : "", map[i].from,
++					     map[i].to);
++	}
++	return len + sysfs_emit_at(buf, len, "\n");
++}
++
++static ssize_t vlan_map_store(struct device *dev, struct device_attribute *attr,
++			      const char *buf, size_t count)
++{
++	struct airoha_xpon *xpon = dev_get_drvdata(dev);
++	struct airoha_pon_vlan_map map[AIROHA_PON_VLAN_MAP_MAX];
++	char *input, *cursor, *token;
++	unsigned int entries = 0;
++	int ret = 0;
++
++	if (sysfs_streq(buf, "clear"))
++		goto apply;
++
++	input = kstrdup(buf, GFP_KERNEL);
++	if (!input)
++		return -ENOMEM;
++
++	cursor = input;
++	while ((token = strsep(&cursor, " \t\n"))) {
++		unsigned int from, to;
++
++		if (!*token)
++			continue;
++		if (entries == ARRAY_SIZE(map)) {
++			ret = -E2BIG;
++			break;
++		}
++		if (sscanf(token, "%u:%u", &from, &to) != 2) {
++			if (sscanf(token, "%u:pop", &from) != 1) {
++				ret = -EINVAL;
++				break;
++			}
++			to = AIROHA_PON_VID_ANY;
++		}
++		if (from > VLAN_VID_MASK ||
++		    (to > VLAN_VID_MASK && to != AIROHA_PON_VID_ANY)) {
++			ret = -EINVAL;
++			break;
++		}
++		map[entries].from = from;
++		map[entries].to = to;
++		entries++;
++	}
++	kfree(input);
++	if (ret)
++		return ret;
++
++apply:
++	ret = airoha_eth_pon_set_vlan_map(xpon->pon_netdev, map, entries);
++	return ret ? ret : count;
++}
++
++static DEVICE_ATTR_RW(vlan_map);
++
+ static DEVICE_ATTR_RW(data_path);
+ 
+ static ssize_t service_ready_show(struct device *dev,
+@@ -341,6 +428,7 @@ static struct attribute *airoha_xpon_attrs[] = {
+ 	&dev_attr_registration_id.attr,
+ 	&dev_attr_omci_msk.attr,
+ 	&dev_attr_data_path.attr,
++	&dev_attr_vlan_map.attr,
+ 	&dev_attr_service_ready.attr,
+ 	NULL,
+ };
+-- 
+2.30.2
+

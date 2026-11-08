@@ -1,0 +1,342 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+#
+# iptv - create the logical PON IPTV service interface and its standard
+# attachment.
+#
+# The PON service layer adds the operator service VLAN upstream and strips the
+# service/multicast VLAN downstream; Linux only sees the untagged logical
+# interface.  This script creates that interface and either:
+#
+#   lan-bridge  add the logical service interface to br-lan
+#   route       create a normal OpenWrt interface on the logical service
+#               interface (DHCP or static addressing)
+#
+# MAC address, DHCP Option 60, Client ID, firewall, NAT and policy routing are
+# deliberately not written here.  They belong to the normal interface
+# configuration in Network -> Interfaces.
+
+. /lib/functions.sh
+
+ACTION="${1:-reload}"
+CFG='onu-iptv'
+STATE_DEVICE='/var/run/iptv.device'
+IPTV_METRIC='2000'
+
+fail() {
+	logger -t iptv "$*"
+	echo "iptv: $*" >&2
+	exit 1
+}
+
+valid_ifname() {
+	case "$1" in
+	''|*[!A-Za-z0-9_.:-]*) return 1 ;;
+	esac
+	[ "${#1}" -le 15 ]
+}
+
+valid_uci_name() {
+	case "$1" in
+	''|*[!A-Za-z0-9_]*) return 1 ;;
+	esac
+}
+
+valid_vlan() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$1" -ge 1 ] && [ "$1" -le 4094 ]
+}
+
+resolve_uplink() {
+	local name="$1"
+
+	[ -e "/sys/class/net/$name" ] && { echo "$name"; return; }
+	case "$name" in
+	pon0) [ -e /sys/class/net/pon ] && echo pon && return ;;
+	pon) [ -e /sys/class/net/pon0 ] && echo pon0 && return ;;
+	esac
+	echo "$name"
+}
+
+load_config() {
+	config_load "$CFG"
+	config_get_bool ENABLED config enabled 0
+	config_get MODE config mode lan-bridge
+	config_get SERVICE_VLAN config service_vlan
+	config_get MULTICAST_VLAN config multicast_vlan
+	config_get DEVICE_NAME config device_name
+	config_get INTERFACE_NAME config interface_name iptv
+	config_get PROTO config proto dhcp
+	config_get IPADDR config ipaddr
+	config_get NETMASK config netmask
+	config_get GATEWAY config gateway
+	config_get DNS config dns
+	config_get UPLINK config uplink pon0
+
+	UPLINK="$(resolve_uplink "$UPLINK")"
+	MCAST_VLAN="${MULTICAST_VLAN:-$SERVICE_VLAN}"
+}
+
+validate_config() {
+	[ "$ENABLED" -eq 1 ] || return 0
+
+	case "$MODE" in
+	lan-bridge|route) ;;
+	*) fail "invalid IPTV mode: $MODE" ;;
+	esac
+
+	valid_ifname "$DEVICE_NAME" ||
+		fail "device_name must be a valid Linux interface name"
+	[ "$DEVICE_NAME" != 'clear' ] ||
+		fail "device_name 'clear' is reserved by the PON service interface"
+	valid_vlan "$SERVICE_VLAN" ||
+		fail "service_vlan must be 1-4094"
+	if [ -n "$MULTICAST_VLAN" ]; then
+		valid_vlan "$MULTICAST_VLAN" ||
+			fail "multicast_vlan must be 1-4094"
+	fi
+	[ -e "/sys/class/net/$UPLINK" ] ||
+		fail "uplink $UPLINK was not found"
+	[ -e "/sys/class/net/$UPLINK/xpon/service" ] ||
+		fail "PON service control is not available on $UPLINK"
+
+	if [ "$MODE" = 'route' ]; then
+		valid_uci_name "$INTERFACE_NAME" ||
+			fail "interface_name must be a valid UCI section name"
+		case "$PROTO" in
+		dhcp|static) ;;
+		*) fail "invalid IPTV interface protocol: $PROTO" ;;
+		esac
+		if [ "$PROTO" = 'static' ]; then
+			[ -n "$IPADDR" ] || fail "static IPTV interface needs an address"
+			[ -n "$NETMASK" ] || fail "static IPTV interface needs a netmask"
+		fi
+	fi
+}
+
+find_br_lan_section() {
+	local section name
+
+	for section in $(uci -q show network 2>/dev/null |
+		sed -n 's/^network\.\([^.=]*\)=device$/\1/p'); do
+		[ "$(uci -q get "network.$section.name")" = 'br-lan' ] &&
+			{ echo "$section"; return 0; }
+	done
+	for section in $(uci -q show network 2>/dev/null |
+		sed -n 's/^network\.\([^.=]*\)=interface$/\1/p'); do
+		[ "$(uci -q get "network.$section.device")" = 'br-lan' ] &&
+			{ echo "$section"; return 0; }
+	done
+	for section in $(uci -q show network 2>/dev/null |
+		sed -n 's/^network\.\([^.=]*\)=interface$/\1/p'); do
+		[ "$(uci -q get "network.$section.type")" = 'bridge' ] ||
+			continue
+		name="$(uci -q get "network.$section.name")"
+		[ -n "$name" ] || name="$(uci -q get "network.$section.ifname")"
+		case "$name" in
+		br-lan|br_lan) echo "$section"; return 0 ;;
+		esac
+	done
+
+	return 1
+}
+
+remove_port_from_bridges() {
+	local port="$1"
+	local section
+
+	for section in $(uci -q show network 2>/dev/null |
+		sed -n 's/^network\.\([^.=]*\)=device$/\1/p'); do
+		uci -q del_list "network.$section.ports=$port"
+	done
+	for section in $(uci -q show network 2>/dev/null |
+		sed -n 's/^network\.\([^.=]*\)=interface$/\1/p'); do
+		uci -q del_list "network.$section.ports=$port"
+	done
+}
+
+remove_managed_network() {
+	local section name
+	local keep_current=0
+
+	# Remove the device created by the previous run before the service layer
+	# unregisters it, including the case where the user renamed it.
+	if [ -r "$STATE_DEVICE" ]; then
+		name="$(cat "$STATE_DEVICE")"
+		[ -n "$name" ] && remove_port_from_bridges "$name"
+	fi
+
+	# Keep only the route interface currently being applied.  Everything else
+	# marked as ours belongs to a previous mode or a previous name.
+	if [ "$ENABLED" -eq 1 ] && [ "$MODE" = 'route' ]; then
+		keep_current=1
+	fi
+	for section in $(uci -q show network 2>/dev/null |
+		sed -n 's/^network\.\([^.=]*\)=interface$/\1/p'); do
+		[ "$(uci -q get "network.$section.iptv_managed")" = '1' ] ||
+			continue
+		[ "$keep_current" -eq 1 ] && [ "$section" = "$INTERFACE_NAME" ] &&
+			continue
+		uci -q delete "network.$section"
+	done
+}
+
+apply_service_device() {
+	local sysfs="/sys/class/net/$UPLINK/xpon/service"
+	local current i
+
+	[ -e "$sysfs" ] || fail "PON service control is not available on $UPLINK"
+
+	current="$(awk 'NR == 1 { print $1 }' "$sysfs" 2>/dev/null)"
+	if [ "$current" != "$DEVICE_NAME" ]; then
+		# A previous bridge or route interface may still own the name until
+		# netifd has processed the removal.
+		i=0
+		while [ -e "/sys/class/net/$DEVICE_NAME" ] && [ "$i" -lt 30 ]; do
+			sleep 0.1
+			i=$((i + 1))
+		done
+		[ ! -e "/sys/class/net/$DEVICE_NAME" ] ||
+			fail "device $DEVICE_NAME already exists"
+	fi
+
+	printf '%s %s %s\n' "$DEVICE_NAME" "$SERVICE_VLAN" "$MCAST_VLAN" \
+		> "$sysfs" ||
+		fail "cannot create PON service device $DEVICE_NAME"
+
+	i=0
+	while [ ! -e "/sys/class/net/$DEVICE_NAME" ] && [ "$i" -lt 30 ]; do
+		sleep 0.1
+		i=$((i + 1))
+	done
+	[ -e "/sys/class/net/$DEVICE_NAME" ] ||
+		fail "PON service device $DEVICE_NAME did not appear"
+}
+
+write_bridge() {
+	local br
+
+	br="$(find_br_lan_section)" ||
+		fail "no br-lan device section found"
+
+	remove_port_from_bridges "$DEVICE_NAME"
+	uci add_list "network.$br.ports=$DEVICE_NAME"
+}
+
+write_route() {
+	local section="network.$INTERFACE_NAME"
+	local managed device
+
+	remove_port_from_bridges "$DEVICE_NAME"
+
+	if uci -q get "$section" >/dev/null; then
+		[ "$(uci -q get "$section")" = 'interface' ] ||
+			fail "network.$INTERFACE_NAME exists and is not an interface"
+
+		managed="$(uci -q get "$section.iptv_managed")"
+		device="$(uci -q get "$section.device")"
+
+		# Adopt an interface that already points at our IPTV device, but
+		# never overwrite an unrelated interface that happens to share
+		# the name.  Keep every user option on an adopted interface:
+		# vendorid, ip4table/ip6table, macaddr, mtu and friends must
+		# survive an IPTV page save.
+		if [ "$managed" != '1' ] && [ "$device" != "$DEVICE_NAME" ]; then
+			fail "network.$INTERFACE_NAME exists and is not managed by iptv"
+		fi
+	else
+		uci set "$section"='interface'
+	fi
+
+	uci set "$section.device"="$DEVICE_NAME"
+	uci set "$section.proto"="$PROTO"
+	uci set "$section.auto"='1'
+	uci set "$section.force_link"='1'
+	uci set "$section.delegate"='0'
+	# Only suppress the default route when this interface is not using
+	# a policy routing table.  With ip4table or ip6table set (any table
+	# number), the default route belongs to that table and is left to
+	# the user/netifd.  ip4rule/ip6rule are user-managed and never
+	# touched.
+	if [ -z "$(uci -q get "$section.ip4table")" ] &&
+	   [ -z "$(uci -q get "$section.ip6table")" ]; then
+		uci set "$section.defaultroute"='0'
+	fi
+	uci set "$section.metric"="$IPTV_METRIC"
+	uci set "$section.iptv_managed"='1'
+
+	if [ "$PROTO" = 'static' ]; then
+		uci set "$section.ipaddr"="$IPADDR"
+		uci set "$section.netmask"="$NETMASK"
+		if [ -n "$GATEWAY" ]; then
+			uci set "$section.gateway"="$GATEWAY"
+		else
+			uci -q delete "$section.gateway"
+		fi
+		if [ -n "$DNS" ]; then
+			uci set "$section.dns"="$DNS"
+		else
+			uci -q delete "$section.dns"
+		fi
+	else
+		# DHCP must not inherit stale static IPv4 settings from an
+		# earlier mode.  Everything else on the interface stays.
+		uci -q delete "$section.ipaddr"
+		uci -q delete "$section.netmask"
+		uci -q delete "$section.gateway"
+		uci -q delete "$section.dns"
+	fi
+}
+
+clear_service() {
+	local sysfs_service="/sys/class/net/$UPLINK/xpon/service"
+	local sysfs_map="/sys/class/net/$UPLINK/xpon/vlan_map"
+
+	[ -e "$sysfs_service" ] && echo clear > "$sysfs_service" 2>/dev/null || true
+	[ -e "$sysfs_map" ] && echo clear > "$sysfs_map" 2>/dev/null || true
+}
+
+reload_runtime() {
+	[ "$ACTION" = 'boot' ] && return 0
+	ubus call network reload >/dev/null 2>&1 || true
+}
+
+load_config
+[ "$ENABLED" -eq 1 ] && validate_config
+
+remove_managed_network
+uci commit network || fail "cannot save network"
+reload_runtime
+
+if [ "$ENABLED" -eq 1 ]; then
+	apply_service_device
+
+	# The service layer owns the service/multicast split; the old global
+	# translation table must stay empty so standard VLAN uppers are not
+	# rewritten.
+	if [ -e "/sys/class/net/$UPLINK/xpon/vlan_map" ]; then
+		echo clear > "/sys/class/net/$UPLINK/xpon/vlan_map" 2>/dev/null || true
+	fi
+
+	case "$MODE" in
+	lan-bridge) write_bridge ;;
+	route) write_route ;;
+	esac
+
+	printf '%s\n' "$DEVICE_NAME" > "$STATE_DEVICE"
+else
+	[ -n "$DEVICE_NAME" ] && remove_port_from_bridges "$DEVICE_NAME"
+	clear_service
+	rm -f "$STATE_DEVICE"
+fi
+
+uci commit network || fail "cannot save network"
+reload_runtime
+
+if [ "$ENABLED" -eq 1 ]; then
+	logger -t iptv "applied (mode=$MODE device=$DEVICE_NAME service=$SERVICE_VLAN multicast=$MCAST_VLAN)"
+else
+	logger -t iptv "disabled"
+fi
+
+exit 0

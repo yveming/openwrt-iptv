@@ -1,0 +1,339 @@
+From 65d792b5850a07c9aed114224013e17d9a5b0b7b Mon Sep 17 00:00:00 2001
+From: ming <ming@localhost>
+Date: Tue, 3 Nov 2026 22:22:12 +0800
+Subject: [PATCH] airoha-xpon: align service netdev with standard VLAN upper
+
+The logical PON service interface carries its own MAC and multicast memberships, but it never synced them to the underlying PON netdev and bypassed the standard VLAN receive path.  Align it with vlan_dev_*:
+
+- RX: use skb_vlan_untag() to pull/reorder the tag and reset headers; only upgrade PACKET_OTHERHOST when the frame really targets the service MAC, like vlan_do_receive(), instead of forcing PACKET_HOST.
+- RX mode: add ndo_set_rx_mode, ndo_change_rx_flags and ndo_set_mac_address, and add/del the service MAC in open/stop, so unicast (DHCP ACK, RTSP/HTTP) and multicast memberships reach the PON filter.
+- Features: advertise VLAN-like hw_features, intersect them with the PON device in ndo_fix_features(), inherit TSO limits and set lltx.  This restores TX checksum/SG/TSO and GRO on the service interface for TCP (EPG/RTSP) and forwarded traffic.
+- Stats: use per-CPU tstats via dev_get_tstats64(), count GRO backlog drops, and expose the parent ifindex through ndo_get_iflink.
+- Headroom: reserve VLAN_HLEN like vlan_dev_init() and inherit vlan_features.
+- Priority: expose the VLAN PCP as skb->priority.
+
+Tested on HG5582A: EPG, RTSP catch-up and 4K multicast work; the DHCP lease is acquired on the service interface.
+---
+ airoha-xpon/Makefile                  |   2 +-
+ airoha-xpon/src/airoha-xpon-service.c | 205 ++++++++++++++++++++++----
+ 2 files changed, 177 insertions(+), 30 deletions(-)
+
+diff --git a/airoha-xpon/Makefile b/airoha-xpon/Makefile
+index f34b34e..1c9629c 100644
+--- a/airoha-xpon/Makefile
++++ b/airoha-xpon/Makefile
+@@ -6,7 +6,7 @@ include $(TOPDIR)/rules.mk
+ include $(INCLUDE_DIR)/kernel.mk
+ 
+ PKG_NAME:=airoha-xpon
+-PKG_RELEASE:=71
++PKG_RELEASE:=72
+ PKG_LICENSE:=GPL-2.0-only
+ 
+ include $(INCLUDE_DIR)/package.mk
+diff --git a/airoha-xpon/src/airoha-xpon-service.c b/airoha-xpon/src/airoha-xpon-service.c
+index 71b3ea4..33b4c83 100644
+--- a/airoha-xpon/src/airoha-xpon-service.c
++++ b/airoha-xpon/src/airoha-xpon-service.c
+@@ -21,6 +21,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/rtnetlink.h>
+ #include <linux/slab.h>
++#include <net/gro_cells.h>
+ 
+ #include "airoha-xpon-private.h"
+ #include "airoha-xpon-service.h"
+@@ -28,6 +29,7 @@
+ struct airoha_xpon_service {
+ 	struct net_device *netdev;
+ 	struct airoha_xpon *xpon;
++	struct gro_cells gro_cells;
+ 	u16 service_vid;
+ 	u16 mcast_vid;
+ };
+@@ -73,20 +75,108 @@ airoha_xpon_service_xmit(struct sk_buff *skb, struct net_device *netdev)
+ 	 */
+ 	__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), vid);
+ 
+-	netdev->stats.tx_packets++;
+-	netdev->stats.tx_bytes += len;
++	dev_sw_netstats_tx_add(netdev, 1, len);
+ 	skb->dev = pon;
+ 	dev_queue_xmit(skb);
+ 
+ 	return NETDEV_TX_OK;
+ }
+ 
++/*
++ * Mirror the standard VLAN upper: the logical service interface has its own
++ * MAC and multicast memberships, so keep them synced to the underlying PON
++ * device.  Otherwise the PON receive filter never learns the service MAC and
++ * unicast frames (DHCP ACK, RTSP/HTTP) are dropped by the hardware.
++ */
++static void
++airoha_xpon_service_set_rx_mode(struct net_device *netdev)
++{
++	struct airoha_xpon_service *svc = netdev_priv(netdev);
++	struct net_device *pon = svc->xpon->pon_netdev;
++
++	if (!pon)
++		return;
++
++	dev_mc_sync(pon, netdev);
++	dev_uc_sync(pon, netdev);
++}
++
++static void
++airoha_xpon_service_change_rx_flags(struct net_device *netdev, int change)
++{
++	struct airoha_xpon_service *svc = netdev_priv(netdev);
++	struct net_device *pon = svc->xpon->pon_netdev;
++
++	if (!pon)
++		return;
++
++	if (change & IFF_ALLMULTI)
++		dev_set_allmulti(pon, netdev->flags & IFF_ALLMULTI ? 1 : -1);
++	if (change & IFF_PROMISC)
++		dev_set_promiscuity(pon, netdev->flags & IFF_PROMISC ? 1 : -1);
++}
++
++static int
++airoha_xpon_service_set_mac_address(struct net_device *netdev, void *p)
++{
++	struct airoha_xpon_service *svc = netdev_priv(netdev);
++	struct net_device *pon = svc->xpon->pon_netdev;
++	struct sockaddr *addr = p;
++	int ret;
++
++	if (!is_valid_ether_addr(addr->sa_data))
++		return -EADDRNOTAVAIL;
++
++	if (pon && (netdev->flags & IFF_UP)) {
++		if (!ether_addr_equal(addr->sa_data, pon->dev_addr)) {
++			ret = dev_uc_add(pon, addr->sa_data);
++			if (ret < 0)
++				return ret;
++		}
++		if (!ether_addr_equal(netdev->dev_addr, pon->dev_addr))
++			dev_uc_del(pon, netdev->dev_addr);
++	}
++
++	eth_hw_addr_set(netdev, addr->sa_data);
++	return 0;
++}
++
++static netdev_features_t
++airoha_xpon_service_fix_features(struct net_device *netdev,
++				 netdev_features_t features)
++{
++	struct airoha_xpon_service *svc = netdev_priv(netdev);
++	struct net_device *pon = svc->xpon->pon_netdev;
++	netdev_features_t old_features = features;
++	netdev_features_t lower_features;
++
++	if (!pon)
++		return features;
++
++	lower_features = netdev_intersect_features(
++		(pon->vlan_features | NETIF_F_RXCSUM), pon->features);
++	if (lower_features & (NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM))
++		lower_features |= NETIF_F_HW_CSUM;
++
++	features = netdev_intersect_features(features, lower_features);
++	features |= old_features & (NETIF_F_SOFT_FEATURES |
++				    NETIF_F_GSO_SOFTWARE_ALL);
++	return features;
++}
++
+ static int airoha_xpon_service_open(struct net_device *netdev)
+ {
+ 	struct airoha_xpon_service *svc = netdev_priv(netdev);
++	struct net_device *pon = svc->xpon->pon_netdev;
++	int ret;
++
++	if (pon && !ether_addr_equal(netdev->dev_addr, pon->dev_addr)) {
++		ret = dev_uc_add(pon, netdev->dev_addr);
++		if (ret < 0)
++			return ret;
++	}
+ 
+-	if (svc->xpon->pon_netdev &&
+-	    netif_carrier_ok(svc->xpon->pon_netdev)) {
++	if (pon && netif_carrier_ok(pon)) {
+ 		netif_carrier_on(netdev);
+ 		netif_tx_wake_all_queues(netdev);
+ 	}
+@@ -96,16 +186,40 @@ static int airoha_xpon_service_open(struct net_device *netdev)
+ 
+ static int airoha_xpon_service_stop(struct net_device *netdev)
+ {
++	struct airoha_xpon_service *svc = netdev_priv(netdev);
++	struct net_device *pon = svc->xpon->pon_netdev;
++
++	if (pon) {
++		dev_mc_unsync(pon, netdev);
++		dev_uc_unsync(pon, netdev);
++		if (!ether_addr_equal(netdev->dev_addr, pon->dev_addr))
++			dev_uc_del(pon, netdev->dev_addr);
++	}
++
+ 	netif_carrier_off(netdev);
+ 	netif_tx_stop_all_queues(netdev);
+ 	return 0;
+ }
+ 
++static int
++airoha_xpon_service_get_iflink(const struct net_device *netdev)
++{
++	struct airoha_xpon_service *svc = netdev_priv(netdev);
++	struct net_device *pon = svc->xpon->pon_netdev;
++
++	return pon ? pon->ifindex : netdev->ifindex;
++}
++
+ static const struct net_device_ops airoha_xpon_service_netdev_ops = {
+ 	.ndo_open = airoha_xpon_service_open,
+ 	.ndo_stop = airoha_xpon_service_stop,
+ 	.ndo_start_xmit = airoha_xpon_service_xmit,
+-	.ndo_set_mac_address = eth_mac_addr,
++	.ndo_set_mac_address = airoha_xpon_service_set_mac_address,
++	.ndo_set_rx_mode = airoha_xpon_service_set_rx_mode,
++	.ndo_change_rx_flags = airoha_xpon_service_change_rx_flags,
++	.ndo_fix_features = airoha_xpon_service_fix_features,
++	.ndo_get_stats64 = dev_get_tstats64,
++	.ndo_get_iflink = airoha_xpon_service_get_iflink,
+ 	.ndo_validate_addr = eth_validate_addr,
+ };
+ 
+@@ -120,6 +234,18 @@ static void airoha_xpon_service_setup(struct net_device *netdev)
+ 	 */
+ 	ether_setup(netdev);
+ 	netdev->netdev_ops = &airoha_xpon_service_netdev_ops;
++	/*
++	 * Advertise the same software features as a standard VLAN upper.
++	 * ndo_fix_features() intersects this with what the underlying PON
++	 * device really supports, so TCP (HTTP/RTSP) and forwarded GSO
++	 * frames keep checksum/segmentation offloads.
++	 */
++	netdev->hw_features = NETIF_F_HW_CSUM | NETIF_F_SG | NETIF_F_FRAGLIST |
++			      NETIF_F_GSO_SOFTWARE_ALL | NETIF_F_GSO_ENCAP_ALL |
++			      NETIF_F_HIGHDMA | NETIF_F_RXCSUM | NETIF_F_GRO;
++	netdev->features = netdev->hw_features;
++	netdev->lltx = true;
++	netdev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
+ 	netdev->needs_free_netdev = true;
+ }
+ 
+@@ -145,6 +271,7 @@ static void airoha_xpon_service_clear_locked(struct airoha_xpon *xpon)
+ 	synchronize_net();
+ 
+ 	if (netdev) {
++		gro_cells_destroy(&svc->gro_cells);
+ 		netif_carrier_off(netdev);
+ 		netif_tx_stop_all_queues(netdev);
+ 		unregister_netdevice(netdev);
+@@ -203,9 +330,27 @@ int airoha_xpon_service_configure(struct airoha_xpon *xpon, const char *name,
+ 	eth_hw_addr_set(netdev, xpon->pon_netdev->dev_addr);
+ 	netif_carrier_off(netdev);
+ 	netif_tx_stop_all_queues(netdev);
++	netif_inherit_tso_max(netdev, xpon->pon_netdev);
++	/*
++	 * Match vlan_dev_init(): the VLAN tag is carried in skb->vlan_tci and
++	 * pushed by the core before xmit, so reserve the extra headroom here
++	 * instead of letting skb_cow_head() reallocate on the TX path.
++	 */
++	netdev->needed_headroom = xpon->pon_netdev->needed_headroom + VLAN_HLEN;
++	netdev->needed_tailroom = xpon->pon_netdev->needed_tailroom;
++	netdev->hard_header_len = xpon->pon_netdev->hard_header_len;
++	netdev->vlan_features = xpon->pon_netdev->vlan_features &
++				~(NETIF_F_FCOE_CRC | NETIF_F_FSO);
++
++	ret = gro_cells_init(&svc->gro_cells, netdev);
++	if (ret) {
++		free_netdev(netdev);
++		goto out;
++	}
+ 
+ 	ret = register_netdevice(netdev);
+ 	if (ret) {
++		gro_cells_destroy(&svc->gro_cells);
+ 		free_netdev(netdev);
+ 		goto out;
+ 	}
+@@ -259,6 +404,7 @@ bool airoha_xpon_service_rx(void *priv, struct sk_buff *skb, u16 vid)
+ 	struct airoha_xpon *xpon = priv;
+ 	struct airoha_xpon_service *svc;
+ 	struct net_device *netdev;
++	u16 tci;
+ 
+ 	if (!xpon)
+ 		return false;
+@@ -277,39 +423,40 @@ bool airoha_xpon_service_rx(void *priv, struct sk_buff *skb, u16 vid)
+ 	}
+ 
+ 	if (skb_vlan_tag_present(skb)) {
++		tci = skb_vlan_tag_get(skb);
+ 		__vlan_hwaccel_clear_tag(skb);
+ 	} else if (eth_type_vlan(skb->protocol)) {
+-		struct vlan_ethhdr *veh;
+-		__be16 proto;
+-		unsigned int len = skb->len;
+-
+-		if (len < VLAN_HLEN) {
+-			dev_kfree_skb_any(skb);
+-			return true;
+-		}
+-
+-		veh = (struct vlan_ethhdr *)skb_mac_header(skb);
+-		proto = veh->h_vlan_encapsulated_proto;
+-
+ 		/*
+-		 * eth_type_trans() pulled the 14-byte Ethernet header, so
+-		 * skb->len starts at the VLAN TCI.  Remove the 4-byte VLAN
+-		 * header and leave skb->data on the payload.
++		 * Use the standard untag path: pull the tag, adjust the
++		 * checksum, reorder the Ethernet header over the tag so
++		 * mac_len matches the real header layout, and set the
++		 * encapsulated protocol.  The logical service interface is
++		 * untagged, so drop the hwaccel tag metadata afterwards.
+ 		 */
+-		memmove((u8 *)veh + 12, (u8 *)veh + 16, len - 2);
+-		skb_trim(skb, len - 4);
+-		skb->protocol = proto;
+-		skb_reset_network_header(skb);
+-		skb_reset_mac_len(skb);
++		skb = skb_vlan_untag(skb);
++		if (!skb)
++			return true; /* skb_vlan_untag() freed it */
++		tci = skb_vlan_tag_get(skb);
++		__vlan_hwaccel_clear_tag(skb);
+ 	} else {
+ 		return false;
+ 	}
+ 
+ 	skb->dev = netdev;
+-	skb->pkt_type = PACKET_HOST;
+-	netdev->stats.rx_packets++;
+-	netdev->stats.rx_bytes += skb->len;
+-	netif_receive_skb(skb);
++	/*
++	 * eth_type_trans() classified the frame against the PON netdev MAC.
++	 * Re-check it against the logical service MAC like vlan_do_receive()
++	 * does: only upgrade OTHERHOST when the frame is really ours.
++	 */
++	if (unlikely(skb->pkt_type == PACKET_OTHERHOST) &&
++	    ether_addr_equal_64bits(eth_hdr(skb)->h_dest, netdev->dev_addr))
++		skb->pkt_type = PACKET_HOST;
++
++	/* Like vlan_do_receive(): expose the VLAN PCP as skb priority. */
++	skb->priority = (tci & VLAN_PRIO_MASK) >> VLAN_PRIO_SHIFT;
++	dev_sw_netstats_rx_add(netdev, skb->len);
++	if (gro_cells_receive(&svc->gro_cells, skb) == NET_RX_DROP)
++		netdev->stats.rx_dropped++;
+ 
+ 	return true;
+ }
+-- 
+2.30.2
+

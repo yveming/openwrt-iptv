@@ -1,0 +1,518 @@
+From 8397135fad8caa60757cf85d7adc75cce61c91bf Mon Sep 17 00:00:00 2001
+From: ming <ming@localhost>
+Date: Sun, 1 Nov 2026 21:07:54 +0800
+Subject: [PATCH] airoha-xpon: add logical PON service interface
+
+---
+ airoha-xpon/Makefile                  |   2 +-
+ airoha-xpon/src/Makefile              |   2 +-
+ airoha-xpon/src/airoha-xpon-control.c |  33 +++
+ airoha-xpon/src/airoha-xpon-main.c    |   5 +
+ airoha-xpon/src/airoha-xpon-private.h |   2 +
+ airoha-xpon/src/airoha-xpon-service.c | 330 ++++++++++++++++++++++++++
+ airoha-xpon/src/airoha-xpon-service.h |  18 ++
+ 7 files changed, 390 insertions(+), 2 deletions(-)
+ create mode 100644 airoha-xpon/src/airoha-xpon-service.c
+ create mode 100644 airoha-xpon/src/airoha-xpon-service.h
+
+diff --git a/airoha-xpon/Makefile b/airoha-xpon/Makefile
+index e2ed510..e0ecc17 100644
+--- a/airoha-xpon/Makefile
++++ b/airoha-xpon/Makefile
+@@ -6,7 +6,7 @@ include $(TOPDIR)/rules.mk
+ include $(INCLUDE_DIR)/kernel.mk
+ 
+ PKG_NAME:=airoha-xpon
+-PKG_RELEASE:=68
++PKG_RELEASE:=69
+ PKG_LICENSE:=GPL-2.0-only
+ 
+ include $(INCLUDE_DIR)/package.mk
+diff --git a/airoha-xpon/src/Makefile b/airoha-xpon/src/Makefile
+index b7abf5b..db2e443 100644
+--- a/airoha-xpon/src/Makefile
++++ b/airoha-xpon/src/Makefile
+@@ -7,4 +7,4 @@ airoha-xpon-y := airoha-xpon-main.o airoha-xpon-identity.o \
+ 	airoha-xpon-netlink.o airoha-xpon-ploam.o airoha-xpon-crypto.o \
+ 	airoha-xpon-control.o airoha-xpon-diagnostics.o airoha-xpon-epon.o \
+ 	airoha-xpon-omci.o airoha-xpon-oam.o \
+-	airoha-xpon-leds.o
++	airoha-xpon-leds.o airoha-xpon-service.o
+diff --git a/airoha-xpon/src/airoha-xpon-control.c b/airoha-xpon/src/airoha-xpon-control.c
+index a985cdb..4f02a19 100644
+--- a/airoha-xpon/src/airoha-xpon-control.c
++++ b/airoha-xpon/src/airoha-xpon-control.c
+@@ -11,6 +11,7 @@
+ 
+ #include "airoha-xpon-private.h"
+ #include "airoha-xpon-epon.h"
++#include "airoha-xpon-service.h"
+ 
+ static size_t airoha_xpon_trimmed_length(const char *buf, size_t count)
+ {
+@@ -420,6 +421,37 @@ static ssize_t service_ready_store(struct device *dev,
+ 
+ 	return ret ? ret : count;
+ }
++
++static ssize_t service_show(struct device *dev, struct device_attribute *attr,
++			    char *buf)
++{
++	struct airoha_xpon *xpon = dev_get_drvdata(dev);
++
++	return airoha_xpon_service_show(xpon, buf);
++}
++
++static ssize_t service_store(struct device *dev, struct device_attribute *attr,
++			     const char *buf, size_t count)
++{
++	struct airoha_xpon *xpon = dev_get_drvdata(dev);
++	char name[IFNAMSIZ];
++	unsigned int service_vid, mcast_vid;
++	int ret;
++
++	if (sysfs_streq(buf, "clear")) {
++		airoha_xpon_service_destroy(xpon);
++		return count;
++	}
++
++	if (sscanf(buf, "%15s %u %u", name, &service_vid, &mcast_vid) != 3)
++		return -EINVAL;
++
++	ret = airoha_xpon_service_configure(xpon, name, service_vid,
++					    mcast_vid);
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_RW(service);
++
+ static DEVICE_ATTR_RW(service_ready);
+ 
+ static struct attribute *airoha_xpon_attrs[] = {
+@@ -429,6 +461,7 @@ static struct attribute *airoha_xpon_attrs[] = {
+ 	&dev_attr_omci_msk.attr,
+ 	&dev_attr_data_path.attr,
+ 	&dev_attr_vlan_map.attr,
++	&dev_attr_service.attr,
+ 	&dev_attr_service_ready.attr,
+ 	NULL,
+ };
+diff --git a/airoha-xpon/src/airoha-xpon-main.c b/airoha-xpon/src/airoha-xpon-main.c
+index 4ecf339..f6479fa 100644
+--- a/airoha-xpon/src/airoha-xpon-main.c
++++ b/airoha-xpon/src/airoha-xpon-main.c
+@@ -24,6 +24,7 @@
+ #include "airoha-xpon-epon.h"
+ #include "airoha-xpon-oam.h"
+ #include "airoha-xpon-omci.h"
++#include "airoha-xpon-service.h"
+ #include "airoha-xpon-xgpon.h"
+ 
+ void airoha_xpon_set_data_path_link(struct airoha_xpon *xpon, bool ready)
+@@ -40,6 +41,8 @@ void airoha_xpon_set_data_path_link(struct airoha_xpon *xpon, bool ready)
+ 		netif_carrier_off(xpon->pon_netdev);
+ 		netif_tx_stop_all_queues(xpon->pon_netdev);
+ 	}
++
++	airoha_xpon_service_set_link(xpon, ready);
+ }
+ 
+ static irqreturn_t airoha_xpon_irq(int irq, void *data)
+@@ -344,6 +347,7 @@ static const struct airoha_pon_link_ops airoha_xpon_link_ops = {
+ 	.stop = airoha_xpon_controller_stop,
+ 	.match_control = airoha_xpon_controller_match_control,
+ 	.rx_control = airoha_xpon_controller_rx_control,
++	.rx_service = airoha_xpon_service_rx,
+ 	.wake_control_tx = airoha_xpon_controller_wake_control_tx,
+ };
+ 
+@@ -774,6 +778,7 @@ static void airoha_xpon_remove(struct platform_device *pdev)
+ 	/* Stop drains work and closes BEN before devm releases IRQ/MMIO. */
+ 	airoha_xpon_debugfs_remove(xpon);
+ 	airoha_xpon_netlink_unregister(xpon);
++	airoha_xpon_service_destroy(xpon);
+ 	airoha_eth_pon_unregister_controller(xpon->pon_netdev, xpon);
+ 	airoha_xpon_controller_stop(xpon);
+ }
+diff --git a/airoha-xpon/src/airoha-xpon-private.h b/airoha-xpon/src/airoha-xpon-private.h
+index ed050a9..ac4e96f 100644
+--- a/airoha-xpon/src/airoha-xpon-private.h
++++ b/airoha-xpon/src/airoha-xpon-private.h
+@@ -23,6 +23,7 @@ struct phylink_pcs;
+ struct regmap;
+ struct airoha_xpon_omci;
+ struct airoha_xpon_oam;
++struct airoha_xpon_service;
+ 
+ enum airoha_xpon_control_protocol {
+ 	AIROHA_XPON_CONTROL_OMCI,
+@@ -260,6 +261,7 @@ struct airoha_xpon {
+ 	struct net_device *pon_netdev;
+ 	struct airoha_xpon_omci *omci;
+ 	struct airoha_xpon_oam *oam;
++	struct airoha_xpon_service __rcu *service;
+ 	struct airoha_xpon_leds *leds;
+ 	struct airoha_xpon_crypto_state crypto;
+ 	struct airoha_xpon_identity_set identity;
+diff --git a/airoha-xpon/src/airoha-xpon-service.c b/airoha-xpon/src/airoha-xpon-service.c
+new file mode 100644
+index 0000000..6ab430b
+--- /dev/null
++++ b/airoha-xpon/src/airoha-xpon-service.c
+@@ -0,0 +1,330 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * PON service netdev.
++ *
++ * The vendor ponvlan layer exposes a logical service interface (veip0.43)
++ * that carries untagged frames.  The PON data netdev below it sees the
++ * operator VLAN tags: the upstream direction adds the service or multicast
++ * VLAN, the downstream direction strips either tag before handing the frame
++ * to the logical interface.
++ *
++ * This is deliberately a single service netdev per PON port.  The IPTV
++ * integration needs one logical interface that can either join br-lan or be
++ * configured as an L3 WAN; the service and multicast VLAN IDs are supplied by
++ * the user and are not assumed here.
++ */
++
++#include <linux/etherdevice.h>
++#include <linux/if_arp.h>
++#include <linux/if_vlan.h>
++#include <linux/module.h>
++#include <linux/netdevice.h>
++#include <linux/rtnetlink.h>
++#include <linux/slab.h>
++
++#include "airoha-xpon-private.h"
++#include "airoha-xpon-service.h"
++
++struct airoha_xpon_service {
++	struct net_device *netdev;
++	struct airoha_xpon *xpon;
++	u16 service_vid;
++	u16 mcast_vid;
++};
++
++static bool airoha_xpon_service_is_multicast(const u8 *addr)
++{
++	/* Match the vendor ponvlan rule: IPv4 and IPv6 multicast only. */
++	return (addr[0] == 0x01 && addr[1] == 0x00 && addr[2] == 0x5e) ||
++	       (addr[0] == 0x33 && addr[1] == 0x33);
++}
++
++static netdev_tx_t
++airoha_xpon_service_xmit(struct sk_buff *skb, struct net_device *netdev)
++{
++	struct airoha_xpon_service *svc = netdev_priv(netdev);
++	struct airoha_xpon *xpon = svc->xpon;
++	struct net_device *pon = xpon->pon_netdev;
++	unsigned int len = skb->len;
++	u16 vid;
++
++	if (unlikely(!pon || !netif_running(pon) || !netif_carrier_ok(pon) ||
++		     skb->len < ETH_HLEN)) {
++		netdev->stats.tx_dropped++;
++		dev_kfree_skb_any(skb);
++		return NETDEV_TX_OK;
++	}
++
++	if (unlikely(skb_vlan_tag_present(skb) ||
++		     eth_type_vlan(((struct ethhdr *)skb->data)->h_proto))) {
++		/* The logical service interface is defined as untagged. */
++		netdev->stats.tx_dropped++;
++		dev_kfree_skb_any(skb);
++		return NETDEV_TX_OK;
++	}
++
++	vid = airoha_xpon_service_is_multicast(skb->data) ?
++		      svc->mcast_vid : svc->service_vid;
++
++	/*
++	 * Match the standard VLAN upper: the frame stays untagged and the
++	 * service VLAN is carried in skb->vlan_tci.  airoha_pon_select_flow()
++	 * reads that tag to pick the GEM; the OLT maps the GEM to the service.
++	 */
++	__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), vid);
++
++	netdev->stats.tx_packets++;
++	netdev->stats.tx_bytes += len;
++	skb->dev = pon;
++	dev_queue_xmit(skb);
++
++	return NETDEV_TX_OK;
++}
++
++static int airoha_xpon_service_open(struct net_device *netdev)
++{
++	struct airoha_xpon_service *svc = netdev_priv(netdev);
++
++	if (svc->xpon->pon_netdev &&
++	    netif_carrier_ok(svc->xpon->pon_netdev)) {
++		netif_carrier_on(netdev);
++		netif_tx_wake_all_queues(netdev);
++	}
++
++	return 0;
++}
++
++static int airoha_xpon_service_stop(struct net_device *netdev)
++{
++	netif_carrier_off(netdev);
++	netif_tx_stop_all_queues(netdev);
++	return 0;
++}
++
++static const struct net_device_ops airoha_xpon_service_netdev_ops = {
++	.ndo_open = airoha_xpon_service_open,
++	.ndo_stop = airoha_xpon_service_stop,
++	.ndo_start_xmit = airoha_xpon_service_xmit,
++};
++
++static void airoha_xpon_service_setup(struct net_device *netdev)
++{
++	netdev->type = ARPHRD_ETHER;
++	netdev->hard_header_len = ETH_HLEN;
++	netdev->addr_len = ETH_ALEN;
++	netdev->mtu = ETH_DATA_LEN;
++	netdev->min_mtu = ETH_MIN_MTU;
++	netdev->max_mtu = ETH_DATA_LEN;
++	netdev->tx_queue_len = 1000;
++	netdev->flags = IFF_BROADCAST | IFF_MULTICAST;
++	netdev->netdev_ops = &airoha_xpon_service_netdev_ops;
++	netdev->needs_free_netdev = true;
++}
++
++static void airoha_xpon_service_clear_locked(struct airoha_xpon *xpon)
++{
++	struct airoha_xpon_service *svc;
++	struct net_device *netdev;
++
++	ASSERT_RTNL();
++
++	svc = rcu_dereference_protected(xpon->service,
++					lockdep_rtnl_is_held());
++	if (!svc)
++		return;
++
++	netdev = svc->netdev;
++	RCU_INIT_POINTER(xpon->service, NULL);
++
++	/*
++	 * The receive hook runs under rcu_read_lock().  Wait for an in-flight
++	 * frame before unregistering the netdev that owns the skb.
++	 */
++	synchronize_net();
++
++	if (netdev) {
++		netif_carrier_off(netdev);
++		netif_tx_stop_all_queues(netdev);
++		unregister_netdevice(netdev);
++	}
++}
++
++int airoha_xpon_service_configure(struct airoha_xpon *xpon, const char *name,
++				  u16 service_vid, u16 mcast_vid)
++{
++	struct airoha_xpon_service *svc;
++	struct net_device *netdev;
++	int ret;
++
++	if (!xpon || !xpon->pon_netdev || !name || !*name)
++		return -EINVAL;
++	if (!dev_valid_name(name) || strlen(name) >= IFNAMSIZ)
++		return -EINVAL;
++	if (service_vid < 1 || service_vid > VLAN_VID_MASK ||
++	    mcast_vid < 1 || mcast_vid > VLAN_VID_MASK)
++		return -EINVAL;
++
++	rtnl_lock();
++
++	svc = rcu_dereference_protected(xpon->service,
++					lockdep_rtnl_is_held());
++	if (svc && svc->netdev && !strcmp(svc->netdev->name, name)) {
++		/* Keep the netdev and its bridge/L3 attachment stable. */
++		svc->service_vid = service_vid;
++		svc->mcast_vid = mcast_vid;
++		ret = 0;
++		goto out;
++	}
++
++	if (__dev_get_by_name(dev_net(xpon->pon_netdev), name)) {
++		ret = -EEXIST;
++		goto out;
++	}
++
++	airoha_xpon_service_clear_locked(xpon);
++
++	netdev = alloc_netdev(sizeof(*svc), name, NET_NAME_UNKNOWN,
++			      airoha_xpon_service_setup);
++	if (!netdev) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	svc = netdev_priv(netdev);
++	svc->xpon = xpon;
++	svc->netdev = netdev;
++	svc->service_vid = service_vid;
++	svc->mcast_vid = mcast_vid;
++
++	SET_NETDEV_DEV(netdev, xpon->dev);
++	dev_net_set(netdev, dev_net(xpon->pon_netdev));
++	eth_hw_addr_set(netdev, xpon->pon_netdev->dev_addr);
++	netif_carrier_off(netdev);
++	netif_tx_stop_all_queues(netdev);
++
++	ret = register_netdevice(netdev);
++	if (ret) {
++		free_netdev(netdev);
++		goto out;
++	}
++
++	rcu_assign_pointer(xpon->service, svc);
++	if (netif_carrier_ok(xpon->pon_netdev)) {
++		netif_carrier_on(netdev);
++		netif_tx_wake_all_queues(netdev);
++	}
++
++	ret = 0;
++
++out:
++	rtnl_unlock();
++	return ret;
++}
++
++void airoha_xpon_service_destroy(struct airoha_xpon *xpon)
++{
++	if (!xpon)
++		return;
++
++	rtnl_lock();
++	airoha_xpon_service_clear_locked(xpon);
++	rtnl_unlock();
++}
++
++void airoha_xpon_service_set_link(struct airoha_xpon *xpon, bool ready)
++{
++	struct airoha_xpon_service *svc;
++
++	if (!xpon)
++		return;
++
++	rcu_read_lock();
++	svc = rcu_dereference(xpon->service);
++	if (svc && svc->netdev) {
++		if (ready) {
++			netif_carrier_on(svc->netdev);
++			netif_tx_wake_all_queues(svc->netdev);
++		} else {
++			netif_carrier_off(svc->netdev);
++			netif_tx_stop_all_queues(svc->netdev);
++		}
++	}
++	rcu_read_unlock();
++}
++
++bool airoha_xpon_service_rx(void *priv, struct sk_buff *skb, u16 vid)
++{
++	struct airoha_xpon *xpon = priv;
++	struct airoha_xpon_service *svc;
++	struct net_device *netdev;
++
++	if (!xpon)
++		return false;
++
++	svc = rcu_dereference(xpon->service);
++	if (!svc)
++		return false;
++	if (vid != svc->service_vid && vid != svc->mcast_vid)
++		return false;
++
++	netdev = svc->netdev;
++	if (!netdev || !netif_running(netdev)) {
++		/* The logical service is down: consume the frame. */
++		dev_kfree_skb_any(skb);
++		return true;
++	}
++
++	if (skb_vlan_tag_present(skb)) {
++		__vlan_hwaccel_clear_tag(skb);
++	} else if (eth_type_vlan(skb->protocol)) {
++		struct vlan_ethhdr *veh;
++		__be16 proto;
++		unsigned int len = skb->len;
++
++		if (len < VLAN_HLEN) {
++			dev_kfree_skb_any(skb);
++			return true;
++		}
++
++		veh = (struct vlan_ethhdr *)skb_mac_header(skb);
++		proto = veh->h_vlan_encapsulated_proto;
++
++		/*
++		 * eth_type_trans() pulled the 14-byte Ethernet header, so
++		 * skb->len starts at the VLAN TCI.  Remove the 4-byte VLAN
++		 * header and leave skb->data on the payload.
++		 */
++		memmove((u8 *)veh + 12, (u8 *)veh + 16, len - 2);
++		skb_trim(skb, len - 4);
++		skb->protocol = proto;
++		skb_reset_network_header(skb);
++		skb_reset_mac_len(skb);
++	} else {
++		return false;
++	}
++
++	skb->dev = netdev;
++	skb->pkt_type = PACKET_HOST;
++	netdev->stats.rx_packets++;
++	netdev->stats.rx_bytes += skb->len;
++	netif_receive_skb(skb);
++
++	return true;
++}
++
++ssize_t airoha_xpon_service_show(struct airoha_xpon *xpon, char *buf)
++{
++	struct airoha_xpon_service *svc;
++	ssize_t len;
++
++	rcu_read_lock();
++	svc = rcu_dereference(xpon->service);
++	if (svc && svc->netdev)
++		len = sysfs_emit(buf, "%s %u %u\n", svc->netdev->name,
++				 svc->service_vid, svc->mcast_vid);
++	else
++		len = sysfs_emit(buf, "clear\n");
++	rcu_read_unlock();
++
++	return len;
++}
+diff --git a/airoha-xpon/src/airoha-xpon-service.h b/airoha-xpon/src/airoha-xpon-service.h
+new file mode 100644
+index 0000000..d06f07b
+--- /dev/null
++++ b/airoha-xpon/src/airoha-xpon-service.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _AIROHA_XPON_SERVICE_H_
++#define _AIROHA_XPON_SERVICE_H_
++
++#include <linux/types.h>
++#include <linux/device.h>
++
++struct airoha_xpon;
++struct sk_buff;
++
++int airoha_xpon_service_configure(struct airoha_xpon *xpon, const char *name,
++				  u16 service_vid, u16 mcast_vid);
++void airoha_xpon_service_destroy(struct airoha_xpon *xpon);
++void airoha_xpon_service_set_link(struct airoha_xpon *xpon, bool ready);
++bool airoha_xpon_service_rx(void *priv, struct sk_buff *skb, u16 vid);
++ssize_t airoha_xpon_service_show(struct airoha_xpon *xpon, char *buf);
++
++#endif /* _AIROHA_XPON_SERVICE_H_ */
+-- 
+2.30.2
+

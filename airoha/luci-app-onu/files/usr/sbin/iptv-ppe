@@ -1,0 +1,50 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+#
+# Show the pieces that decide where IPTV traffic actually goes.  This is a
+# diagnostic helper, not a configuration backend:
+#
+#   - the PON-side service/multicast VLAN translation table
+#   - the bridge control-plane ports and multicast database
+#   - the PPE L2B entries installed from bridge cache misses
+#
+# A bound L2B entry means the flow is programmed in the Airoha PPE.  AN7581
+# native L2B entries do not use the generic PPE stats layout, so their
+# packets/bytes fields may stay zero even while traffic is forwarded.
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+pon_dev=
+for dev in pon0 pon; do
+	if [ -e "/sys/class/net/$dev/xpon/vlan_map" ]; then
+		pon_dev="$dev"
+		break
+	fi
+done
+
+echo "== PON VLAN translation =="
+if [ -n "$pon_dev" ]; then
+	printf '%s: ' "$pon_dev"
+	cat "/sys/class/net/$pon_dev/xpon/vlan_map"
+else
+	echo "no PON xpon sysfs found"
+fi
+
+echo
+echo "== bridge control plane =="
+if command -v bridge >/dev/null 2>&1; then
+	bridge link show 2>/dev/null
+	bridge mdb show 2>/dev/null
+	bridge fdb show 2>/dev/null | grep -v 'permanent' | head -40
+else
+	echo "bridge command is not installed"
+fi
+
+echo
+echo "== PPE L2B entries =="
+if [ -r /sys/kernel/debug/ppe/bind ]; then
+	awk '$3 == "L2B" { print }' /sys/kernel/debug/ppe/bind
+else
+	echo "PPE debugfs is not mounted or unavailable"
+fi

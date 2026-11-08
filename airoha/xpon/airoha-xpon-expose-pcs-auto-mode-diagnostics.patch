@@ -1,0 +1,93 @@
+From 783e645adb7cc4e9558558ead4f5404e841a53ce Mon Sep 17 00:00:00 2001
+From: ming <ming@localhost>
+Date: Sun, 1 Nov 2026 22:31:03 +0800
+Subject: [PATCH] airoha-xpon: expose PCS auto-mode diagnostics
+
+---
+ airoha-xpon/Makefile                      |  2 +-
+ airoha-xpon/src/airoha-xpon-diagnostics.c | 19 ++++++++++++++++++-
+ airoha-xpon/src/airoha-xpon-netlink.h     |  5 +++++
+ 3 files changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/airoha-xpon/Makefile b/airoha-xpon/Makefile
+index e0ecc17..b36bccd 100644
+--- a/airoha-xpon/Makefile
++++ b/airoha-xpon/Makefile
+@@ -6,7 +6,7 @@ include $(TOPDIR)/rules.mk
+ include $(INCLUDE_DIR)/kernel.mk
+ 
+ PKG_NAME:=airoha-xpon
+-PKG_RELEASE:=69
++PKG_RELEASE:=70
+ PKG_LICENSE:=GPL-2.0-only
+ 
+ include $(INCLUDE_DIR)/package.mk
+diff --git a/airoha-xpon/src/airoha-xpon-diagnostics.c b/airoha-xpon/src/airoha-xpon-diagnostics.c
+index 3e2bed8..35f9b88 100644
+--- a/airoha-xpon/src/airoha-xpon-diagnostics.c
++++ b/airoha-xpon/src/airoha-xpon-diagnostics.c
+@@ -8,6 +8,7 @@
+ #include <linux/jiffies.h>
+ #include <linux/minmax.h>
+ #include <linux/netdevice.h>
++#include <linux/pcs/pcs-airoha.h>
+ #include <linux/seq_file.h>
+ #include <net/netlink.h>
+ 
+@@ -112,13 +113,16 @@ int airoha_xpon_put_status(struct sk_buff *reply, struct airoha_xpon *xpon)
+ 		                                  "denied",
+ 		                                  "unknown" };
+ 	struct airoha_pon_frontend_diagnostics optics = {};
++	struct airoha_pcs_pon_rx_status pcs = {};
+ 	struct nlattr *group;
+ 	bool epon, active_epon;
+-	int optics_error, ret = -EMSGSIZE;
++	int optics_error, pcs_error = -EOPNOTSUPP, ret = -EMSGSIZE;
+ 
+ 	/* Read I2C telemetry outside the line-state lock used by protocol IRQs. */
+ 	optics_error =
+ 		airoha_pon_frontend_get_diagnostics(xpon->frontend, &optics);
++	if (xpon->pcs)
++		pcs_error = airoha_pcs_pon_get_rx_status(xpon->pcs, &pcs);
+ 	mutex_lock(&xpon->state_lock);
+ 	active_epon = xpon->active_mode_valid &&
+ 	              airoha_xpon_mode_is_epon(xpon->active_mode);
+@@ -180,6 +184,19 @@ int airoha_xpon_put_status(struct sk_buff *reply, struct airoha_xpon *xpon)
+ 	    nla_put_string(reply, XPON_LINE_PCS_PROFILE,
+ 	                   airoha_xpon_pcs_profile_name(xpon->pcs_profile)))
+ 		goto out;
++	if (!pcs_error) {
++		if (nla_put_u8(reply, XPON_LINE_PCS_SIGNAL_DETECTED,
++		               pcs.signal_detected) ||
++		    nla_put_u32(reply, XPON_LINE_PCS_RX_MODE_RAW,
++		                pcs.rx_mode_raw) ||
++		    nla_put_u8(reply, XPON_LINE_PCS_FREQDET_LOCKED,
++		               pcs.freqdet_locked) ||
++		    nla_put_u32(reply, XPON_LINE_PCS_FREQUENCY_LEVEL,
++		                pcs.frequency_level) ||
++		    nla_put_u32(reply, XPON_LINE_PCS_FREQUENCY_TARGET,
++		                pcs.frequency_target))
++			goto out;
++	}
+ 	nla_nest_end(reply, group);
+ 
+ 	group = nla_nest_start(reply, AIROHA_XPON_ATTR_FRONTEND);
+diff --git a/airoha-xpon/src/airoha-xpon-netlink.h b/airoha-xpon/src/airoha-xpon-netlink.h
+index 85d166d..d089d14 100644
+--- a/airoha-xpon/src/airoha-xpon-netlink.h
++++ b/airoha-xpon/src/airoha-xpon-netlink.h
+@@ -51,6 +51,11 @@ enum airoha_xpon_line_attr {
+ 	XPON_LINE_PCS_SYNC,
+ 	XPON_LINE_PCS_PROFILE_VALID,
+ 	XPON_LINE_PCS_PROFILE,
++	XPON_LINE_PCS_SIGNAL_DETECTED,
++	XPON_LINE_PCS_RX_MODE_RAW,
++	XPON_LINE_PCS_FREQDET_LOCKED,
++	XPON_LINE_PCS_FREQUENCY_LEVEL,
++	XPON_LINE_PCS_FREQUENCY_TARGET,
+ };
+ 
+ enum airoha_xpon_frontend_attr {
+-- 
+2.30.2
+

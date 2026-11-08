@@ -1,0 +1,4 @@
+9994-net-airoha-resolve-pon-vlan-bridge-port.patch
+9995-net-airoha-add-pon-vlan-translation.patch
+9996-net-airoha-keep-vlan-unaware-bridge-egress-untagged.patch
+9997-net-airoha-add-pon-service-rx-hook.patch

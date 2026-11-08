@@ -1,0 +1,17 @@
+# The PON IPTV service interface.  This page creates the logical service
+# netdev and either bridges it to LAN or creates a route interface on it.
+# MAC address, DHCP Option 60 and Client ID are configured in Network ->
+# Interfaces after the interface exists.
+config iptv 'config'
+	option enabled '0'
+	option mode 'lan-bridge'
+	option uplink 'pon0'
+	option service_vlan ''
+	option multicast_vlan ''
+	option device_name ''
+	option interface_name 'iptv'
+	option proto 'dhcp'
+	option ipaddr ''
+	option netmask ''
+	option gateway ''
+	option dns ''
