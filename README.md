@@ -53,8 +53,10 @@ config iptv 'config'
 	option macaddr ''
 ```
 
-`iptv-scripts` creates `itv` at boot (`START=19`, before network). Address
-and bridging are configured with the standard Network pages:
+`iptv-scripts` creates `itv` at boot (`START=19`, before network). Select it
+in the image config (`CONFIG_PACKAGE_iptv-scripts=y`); `luci-app-iptv` also
+pulls it in through its package dependency. Address and bridging are
+configured with the standard Network pages:
 
 - routed: create an interface with device `itv` and protocol DHCP or static;
 - bridged: add `itv` to a bridge device's port list.
