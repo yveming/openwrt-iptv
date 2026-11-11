@@ -100,29 +100,18 @@ Device/fiberhome_hg5582a
 
 It must include the IPTV packages above; `luci-app-iptv` pulls `kmod-iptv`.
 
-## First-image package omissions
+## First-image package omission
 
-The first PON HG5582A image was about 2 MiB smaller than the reference voice
-image.  The missing packages were:
+The first PON HG5582A image was missing the IPTV-specific helper:
 
 ```text
-asterisk-app-playtones
-asterisk-app-record
-asterisk-bridge-simple
-asterisk-codec-alaw
-asterisk-codec-g722
-asterisk-codec-ulaw
-asterisk-format-wav
-asterisk-res-musiconhold
-asterisk-res-rtp-asterisk
-asterisk-sounds
-luci-app-airoha-npu
 kmod-nf-nathelper-rtsp
 ```
 
-Only the last item is IPTV-specific; the others were voice/Asterisk runtime
-packages.  The general lesson applies here too: compare the **per-device APK
-database**, not just the seed or the target-level manifest.
+It was added back after setting `CONFIG_PACKAGE_kmod-ipt-core=m` for the
+build.  The general lesson is to compare the **per-device APK database**, not
+just the seed or the target-level manifest.  Voice/Asterisk package omissions
+are recorded in the `airoha-voice` repository instead.
 
 ## Verification
 
