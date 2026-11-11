@@ -4,7 +4,7 @@ Archived: 2026-11-08
 
 ## Base
 
-- Source tree: `~/HG5582A/work/openwrt-pon-hg5582a`
+- Source tree: `HG5582A/work/openwrt-pon-hg5582a`
 - Branch: `hg5582a-work`
 - HEAD: `ead24ef897` (2026-11-02)
 - Driver feed: `feeds/pon_drivers`, origin `yveming/openwrt-pon-drivers`
