@@ -110,8 +110,7 @@ kmod-nf-nathelper-rtsp
 
 It was added back after setting `CONFIG_PACKAGE_kmod-ipt-core=m` for the
 build.  The general lesson is to compare the **per-device APK database**, not
-just the seed or the target-level manifest.  Voice/Asterisk package omissions
-are recorded in the `airoha-voice` repository instead.
+just the seed or the target-level manifest.
 
 ## Verification
 
