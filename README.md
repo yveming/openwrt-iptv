@@ -62,6 +62,12 @@ configured with the standard Network pages:
 
 No custom netifd protocol is required.
 
+## Documentation
+
+- `docs/design.md` — netdevice model and data path
+- `docs/offload.md` — offload seam and limitations
+- `docs/pon-integration.md` — PON/OpenWrt package, seed, omcproxy and xtables notes
+
 ## Build
 
 As an OpenWrt feed (optional):
